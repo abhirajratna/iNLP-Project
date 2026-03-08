@@ -8,4 +8,7 @@ dependencies = [
     "numpy>=2.4.2",
     "pandas>=3.0.1",
     "torch>=2.10.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-cpp>=0.23.0",
+    "torch-geometric>=2.5.0",
 ]
