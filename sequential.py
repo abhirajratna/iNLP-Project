@@ -293,6 +293,21 @@ class BiLSTMStyleClassifier(nn.Module):
 
         return self.classifier(context)
 
+    def get_sequence_features(
+        self,
+        token_ids: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _, T = token_ids.shape
+        embedded = self.embedding(token_ids)
+        packed = pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        lstm_packed, _ = self.lstm(packed)
+        H_seq, _ = pad_packed_sequence(lstm_packed, batch_first=True, total_length=T)
+        mask = torch.arange(T, device=token_ids.device).unsqueeze(0) < lengths.unsqueeze(1)
+        return H_seq, mask
+
 
 def load_data(config: Config):
     print(f"Loading from: {config.DATA_PATH}")

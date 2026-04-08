@@ -37,6 +37,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class AlignConfig(WAConfig):
     CALIB_BATCHES = 10
+    ALIGNMENT_TYPE = "logit"
 
 
 class ActivationCollector:
@@ -209,6 +210,79 @@ def align_bilstm_weight_correlation(
 
     aligned_sd = permute_bilstm_classifier_layer(
         target_sd, perm, layer_prefix="classifier.1"
+    )
+    return aligned_sd
+
+
+def permute_bilstm_embedding_dim(
+    state_dict: Dict[str, torch.Tensor],
+    perm: np.ndarray,
+) -> Dict[str, torch.Tensor]:
+    sd = OrderedDict(state_dict)
+    perm_t = torch.from_numpy(perm).long()
+
+    w_key = "classifier.1.weight"
+    if w_key in sd:
+        sd[w_key] = sd[w_key][:, perm_t]
+
+    return sd
+
+
+def align_bilstm_feature_level(
+    ref_model: "BiLSTMStyleClassifier",
+    target_sd: Dict[str, torch.Tensor],
+    model_factory,
+    calib_loader: "DataLoader",
+    device: str,
+    use_lex: bool,
+    num_batches: int = 10,
+) -> Dict[str, torch.Tensor]:
+    target_model = model_factory()
+    target_model.load_state_dict({k: v.to(device) for k, v in target_sd.items()})
+    target_model.to(device).eval()
+
+    ref_collector = ActivationCollector()
+    tgt_collector = ActivationCollector()
+
+    hook_name = "attn_pool"
+    ref_collector.register(ref_model.eval(), [hook_name])
+    tgt_collector.register(target_model,     [hook_name])
+
+    with torch.no_grad():
+        for i, batch in enumerate(calib_loader):
+            if i >= num_batches:
+                break
+            token_ids = batch["token_ids"].to(device)
+            lengths   = batch["lengths"].to(device)
+            lex_feats = batch.get("lex_feats")
+            if lex_feats is not None:
+                lex_feats = lex_feats.to(device)
+            ref_model(token_ids, lengths, lex_feats)
+            target_model(token_ids, lengths, lex_feats)
+
+    ref_acts = ref_collector.get_mean_activations()
+    tgt_acts = tgt_collector.get_mean_activations()
+    ref_collector.clear()
+    tgt_collector.clear()
+
+    if hook_name not in ref_acts or hook_name not in tgt_acts:
+        print(
+            "  WARNING: Could not collect attn_pool activations; "
+            "returning unaligned state dict."
+        )
+        return target_sd
+
+    ref_vec = ref_acts[hook_name].float()
+    tgt_vec = tgt_acts[hook_name].float()
+
+    cost = (ref_vec.unsqueeze(1) - tgt_vec.unsqueeze(0)).pow(2).numpy()
+    perm = find_permutation(cost)
+
+    aligned_sd = permute_bilstm_embedding_dim(target_sd, perm)
+
+    print(
+        f"  [feature-align] permuted {len(perm)} embedding dims  "
+        f"(hook='{hook_name}')"
     )
     return aligned_sd
 
@@ -391,11 +465,7 @@ def main():
     model.load_state_dict({k: v.to(config.DEVICE) for k, v in act_avg_sd.items()})
     model.to(config.DEVICE)
     _, act_acc, preds_act, labels_act = seq_evaluate(
-        model,
-        test_loader,
-        criterion,
-        config.DEVICE,
-        use_lex,
+        model, test_loader, criterion, config.DEVICE, use_lex,
     )
     print(f"  Activation-Aligned WA  test_acc = {act_acc:.4f}")
 
@@ -411,13 +481,42 @@ def main():
     model.load_state_dict({k: v.to(config.DEVICE) for k, v in wt_avg_sd.items()})
     model.to(config.DEVICE)
     _, wt_acc, preds_wt, labels_wt = seq_evaluate(
-        model,
-        test_loader,
-        criterion,
-        config.DEVICE,
-        use_lex,
+        model, test_loader, criterion, config.DEVICE, use_lex,
     )
     print(f"  Weight-Corr Aligned WA test_acc = {wt_acc:.4f}")
+
+    print("\n── Feature-Level Alignment + WA ──")
+    print(f"   (alignment_type='{config.ALIGNMENT_TYPE}')")
+    feat_aligned_sds = [state_dicts[0]]
+    for i in range(1, len(state_dicts)):
+        if config.ALIGNMENT_TYPE == "feature":
+            print(f"  Aligning model {i} to reference (feature / attn-pool) …")
+            aligned = align_bilstm_feature_level(
+                ref_model,
+                state_dicts[i],
+                model_factory,
+                val_loader,
+                config.DEVICE,
+                use_lex,
+                num_batches=config.CALIB_BATCHES,
+            )
+        else:
+            print(f"  [logit mode] Aligning model {i} (activation) …")
+            aligned = align_bilstm_activation(
+                ref_model, state_dicts[i], model_factory,
+                val_loader, config.DEVICE, use_lex,
+                num_batches=config.CALIB_BATCHES,
+            )
+        feat_aligned_sds.append(aligned)
+
+    feat_avg_sd = uniform_weight_average(feat_aligned_sds)
+    model = model_factory()
+    model.load_state_dict({k: v.to(config.DEVICE) for k, v in feat_avg_sd.items()})
+    model.to(config.DEVICE)
+    _, feat_acc, preds_feat, labels_feat = seq_evaluate(
+        model, test_loader, criterion, config.DEVICE, use_lex,
+    )
+    print(f"  Feature-Aligned WA     test_acc = {feat_acc:.4f}")
 
     print("\n" + "=" * 50)
     print("  Summary")
@@ -436,11 +535,13 @@ def main():
     print(f"  Naive Weight Average:               test_acc={naive_acc:.4f}")
     print(f"  Activation-Aligned WA:              test_acc={act_acc:.4f}")
     print(f"  Weight-Correlation Aligned WA:      test_acc={wt_acc:.4f}")
+    print(f"  Feature-Aligned WA:                 test_acc={feat_acc:.4f}")
 
     best_method = max(
         [
-            ("Activation-Aligned", act_acc, preds_act, labels_act),
-            ("Weight-Corr Aligned", wt_acc, preds_wt, labels_wt),
+            ("Activation-Aligned",  act_acc,  preds_act,  labels_act),
+            ("Weight-Corr Aligned", wt_acc,   preds_wt,   labels_wt),
+            ("Feature-Aligned",     feat_acc, preds_feat, labels_feat),
         ],
         key=lambda x: x[1],
     )
@@ -450,10 +551,12 @@ def main():
     save_path = "alignment_fusion_results.pt"
     torch.save(
         {
-            "activation_aligned_wa": act_avg_sd,
+            "activation_aligned_wa":  act_avg_sd,
             "weight_corr_aligned_wa": wt_avg_sd,
-            "naive_wa": naive_sd,
-            "author2idx": author2idx,
+            "feature_aligned_wa":     feat_avg_sd,
+            "naive_wa":               naive_sd,
+            "author2idx":             author2idx,
+            "alignment_type":         config.ALIGNMENT_TYPE,
         },
         save_path,
     )

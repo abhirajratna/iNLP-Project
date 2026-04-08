@@ -262,6 +262,21 @@ class ASTGATClassifier(nn.Module):
 
         return graph_emb
 
+    def get_node_embeddings(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        depth: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self._node_features(x, depth)
+        for conv, norm in zip(self.gat_layers, self.gat_norms):
+            h = conv(h, edge_index)
+            h = norm(h)
+            h = F.elu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+        return h, batch
+
 
 def load_data(config: ASTConfig):
     import glob as _glob

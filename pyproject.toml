@@ -11,4 +11,5 @@ dependencies = [
     "tree-sitter>=0.23.0",
     "tree-sitter-cpp>=0.23.0",
     "torch-geometric>=2.5.0",
+    "scipy>=1.17.1",
 ]

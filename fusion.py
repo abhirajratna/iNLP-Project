@@ -245,6 +245,31 @@ class FeatureFusionClassifier(nn.Module):
     ) -> torch.Tensor:
         return self.graph_branch.get_embedding(x, edge_index, depth, batch)
 
+    def get_embedding(
+        self,
+        token_ids: torch.Tensor,
+        lengths: torch.Tensor,
+        graph_x: torch.Tensor,
+        edge_index: torch.Tensor,
+        graph_depth: torch.Tensor,
+        graph_batch: torch.Tensor,
+        graph_valid: Optional[torch.Tensor] = None,
+        lex_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        seq_emb = self.get_seq_embedding(token_ids, lengths)
+        graph_emb = self.get_graph_embedding(
+            graph_x, edge_index, graph_depth, graph_batch
+        )
+
+        if graph_valid is not None:
+            graph_emb = graph_emb * graph_valid.float().unsqueeze(-1)
+
+        parts = [seq_emb, graph_emb]
+        if lex_feats is not None and self.lex_feature_dim > 0:
+            parts.append(lex_feats)
+
+        return torch.cat(parts, dim=-1)
+
     def forward(
         self,
         token_ids: torch.Tensor,
@@ -448,21 +473,21 @@ def main():
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         collate_fn=collate,
-        num_workers=2,
+        num_workers=0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         collate_fn=collate,
-        num_workers=2,
+        num_workers=0,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         collate_fn=collate,
-        num_workers=2,
+        num_workers=0,
     )
 
     model = FeatureFusionClassifier(
