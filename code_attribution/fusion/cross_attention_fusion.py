@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import random
 import warnings
 from functools import partial
@@ -18,7 +22,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torch_geometric.data import Batch
 from torch_geometric.utils import to_dense_batch
 
-from sequential import (
+from code_attribution.sequential import (
     Config as SeqConfig,
     CharVocabulary,
     LexicalFeatureExtractor,
@@ -27,12 +31,12 @@ from sequential import (
     load_data,
     stratified_split,
 )
-from ast_gnn import (
+from code_attribution.ast_gnn import (
     ASTConfig,
     ASTGraphBuilder,
     ASTGATClassifier,
 )
-from fusion import (
+from code_attribution.fusion.fusion import (
     FusionConfig,
     FusionDataset,
     fusion_collate_fn,

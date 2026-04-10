@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import re
 import random
 import warnings
@@ -14,7 +18,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from torch_geometric.data import Data, Batch
 
-from sequential import (
+from code_attribution.sequential import (
     Config as SeqConfig,
     CharVocabulary,
     LexicalFeatureExtractor,
@@ -22,7 +26,7 @@ from sequential import (
     load_data,
     stratified_split,
 )
-from ast_gnn import (
+from code_attribution.ast_gnn import (
     ASTConfig,
     ASTGraphBuilder,
     ASTGATClassifier,

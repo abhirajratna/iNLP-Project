@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import re
 import random
 import numpy as np
@@ -315,7 +319,7 @@ def main():
     cfg = MultiSiamConfig()
     torch.manual_seed(cfg.SEED)
     
-    from siamese import load_raw_data
+    from .siamese import load_raw_data
     df, author2idx = load_raw_data(cfg)
     authors = df["label"].unique()
     train_idx, val_idx, test_idx = [], [], []

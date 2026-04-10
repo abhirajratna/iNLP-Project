@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import copy
 import random
 import warnings
@@ -13,7 +17,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-from sequential import (
+from code_attribution.sequential import (
     Config as SeqConfig,
     CharVocabulary,
     LexicalFeatureExtractor,

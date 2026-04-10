@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import random
 import numpy as np
@@ -9,7 +13,7 @@ from sklearn.manifold import TSNE
 from typing import List
 
 # Import components from multisiam
-from multisiamese.multisiam import (
+from code_verification.multisiamese.multisiam import (
     MultiSiamConfig, 
     CharVocabulary, 
     MultiSiamEncoder, 
@@ -49,7 +53,7 @@ def main():
     random.seed(seed)
 
     # 1. Load Data
-    from multisiamese.siamese import load_raw_data
+    from code_verification.multisiamese.siamese import load_raw_data
     df, author2idx = load_raw_data(cfg)
     
     # 2. Select Authors for Visualization
@@ -69,7 +73,7 @@ def main():
 
     # 3. Initialize Models
     # Load Weights and Metadata
-    checkpoint = torch.load("multisiam_author_model.pt", weights_only=False)
+    checkpoint = torch.load("code_verification/multisiamese/multisiam_wo_lexical_30.pt", weights_only=False)
     vocab = checkpoint['vocab']
     
     # Adaptive Architecture: Check weight shape to detect if lex_feats were used
@@ -127,7 +131,7 @@ def main():
         x=reduced_initial[:, 0], y=reduced_initial[:, 1], 
         hue=author_names, ax=axes[0], palette=palette, alpha=0.6, s=30
     )
-    axes[0].set_title("Embeddings BEFORE Training (30 Authors)", fontsize=18)
+    axes[0].set_title("BEFORE Training", fontsize=18)
     axes[0].legend().remove()
 
     # Plot Trained
@@ -135,13 +139,13 @@ def main():
         x=reduced_trained[:, 0], y=reduced_trained[:, 1], 
         hue=author_names, ax=axes[1], palette=palette, alpha=0.6, s=30
     )
-    axes[1].set_title("Embeddings AFTER MultiSiam Training (30 Authors)", fontsize=18)
+    axes[1].set_title("AFTER MultiSiam Training", fontsize=18)
     # Put legend outside to the right
     axes[1].legend(title="Authors", bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
 
     plt.tight_layout()
-    plt.savefig("embedding_analysis_30.png", dpi=300, bbox_inches='tight')
-    print("Visualization saved to embedding_analysis_30.png")
+    plt.savefig("embedding_analysis.png", dpi=300, bbox_inches='tight')
+    print("Visualization saved to embedding_analysis.png")
 
 if __name__ == "__main__":
     main()

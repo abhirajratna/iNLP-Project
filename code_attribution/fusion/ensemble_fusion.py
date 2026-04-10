@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import random
 import warnings
 from typing import Dict, List, Optional, Tuple
@@ -14,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
-from sequential import (
+from code_attribution.sequential import (
     Config as SeqConfig,
     CharVocabulary,
     LexicalFeatureExtractor,
@@ -24,7 +28,7 @@ from sequential import (
     stratified_split,
     make_collate_fn,
 )
-from ast_gnn import (
+from code_attribution.ast_gnn import (
     ASTConfig,
     ASTGraphBuilder,
     ASTGATClassifier,

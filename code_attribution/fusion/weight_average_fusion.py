@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import copy
 import random
 import warnings
@@ -15,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
-from sequential import (
+from code_attribution.sequential import (
     Config as SeqConfig,
     CharVocabulary,
     LexicalFeatureExtractor,
@@ -27,7 +31,7 @@ from sequential import (
     train_epoch as seq_train_epoch,
     evaluate as seq_evaluate,
 )
-from ast_gnn import (
+from code_attribution.ast_gnn import (
     ASTConfig,
     ASTGraphBuilder,
     ASTGATClassifier,
@@ -289,7 +293,7 @@ def train_gat_multi_seed(config: WAConfig):
     ast_cfg.TOP_N_AUTHORS = config.TOP_N_AUTHORS
     ast_cfg.MIN_SAMPLES_PER_AUTHOR = config.MIN_SAMPLES_PER_AUTHOR
 
-    from ast_gnn import load_data as gnn_load_data
+    from code_attribution.ast_gnn import load_data as gnn_load_data
 
     df, top_authors, author2idx = gnn_load_data(ast_cfg)
     train_df, val_df, test_df = stratified_split(
