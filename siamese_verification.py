@@ -1,33 +1,3 @@
-"""
-Siamese Metric Learning for Code Authorship Verification
-==========================================================
-Goal: Given a person and their code samples, determine whether a new piece
-      of code was written by them — a *verification* (binary) task rather
-      than an *attribution* (multi-class) task.
-
-Approach
---------
-  1. **Embedding network** – Bi-LSTM + Attention Pooling (reused from
-     sequential.py) followed by a projection MLP that maps code to a
-     128-d L2-normalised embedding.
-  2. **Metric losses** – combined Triplet + Contrastive loss with smart
-     online mining (semi-hard triplets, hard negatives).
-  3. **Class-balanced batching** – each batch contains samples from
-     multiple authors with ≥2 samples per author, enabling rich in-batch
-     pair / triplet enumeration.
-  4. **Verification inference** – cosine similarity between two code
-     embeddings, compared against a learned threshold (EER-optimal).
-
-Dataset : GCJ (Google Code Jam C++ solutions)
-Column  : flines   → raw source code
-Label   : username → author to predict
-
-Usage
------
-    python siamese_verification.py                     # full training
-    python siamese_verification.py --epochs 2          # quick smoke test
-"""
-
 import os
 import re
 import math
@@ -40,7 +10,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import torch
@@ -50,12 +20,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
 class SiameseConfig:
-    # ── Data ──────────────────────────────────────────────────────────────
     DATA_PATH              = "datasets/"
     CODE_COLUMN            = "flines"
     AUTHOR_COLUMN          = "username"
@@ -63,46 +28,36 @@ class SiameseConfig:
     MIN_SAMPLES_PER_AUTHOR = 5
     MAX_SEQ_LEN            = 2000
 
-    # ── Vocabulary & lexical features ─────────────────────────────────────
     VOCAB_SIZE             = 200
     USE_LEXICAL_FEATURES   = True
 
-    # ── Embedding network ─────────────────────────────────────────────────
     CHAR_EMBED_DIM         = 64
     LSTM_HIDDEN_DIM        = 256
     LSTM_NUM_LAYERS        = 2
     LSTM_DROPOUT           = 0.3
-    PROJECTION_DIM         = 128    # final embedding dimension
+    PROJECTION_DIM         = 128
 
-    # ── Metric learning ───────────────────────────────────────────────────
     MARGIN_TRIPLET         = 1.0
     MARGIN_CONTRASTIVE     = 1.0
-    LOSS_WEIGHT_TRIPLET    = 0.6    # α  (contrastive gets 1 − α)
+    LOSS_WEIGHT_TRIPLET    = 0.6
 
-    # ── Training ──────────────────────────────────────────────────────────
-    BATCH_SIZE             = 64     # larger batches → richer in-batch mining
-    AUTHORS_PER_BATCH      = 8     # P  (class-balanced: P authors × K each)
-    SAMPLES_PER_AUTHOR     = 8     # K
+    BATCH_SIZE             = 64
+    AUTHORS_PER_BATCH      = 8
+    SAMPLES_PER_AUTHOR     = 8
     EPOCHS                 = 30
-    WARMUP_EPOCHS          = 3     # freeze LSTM, train projection only
+    WARMUP_EPOCHS          = 3
     LR                     = 1e-3
     LR_FINETUNE            = 3e-4
     WEIGHT_DECAY           = 1e-4
     SEED                   = 42
 
-    # ── Split ratios ──────────────────────────────────────────────────────
     VAL_RATIO              = 0.10
     TEST_RATIO             = 0.10
 
-    # ── Paths ─────────────────────────────────────────────────────────────
     PRETRAINED_PATH        = "bilstm_style_classifier.pt"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lexical Feature Extractor  (copied from sequential.py for self-containment)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class LexicalFeatureExtractor:
     KEYWORDS = [
@@ -124,24 +79,20 @@ class LexicalFeatureExtractor:
         features: List[float] = []
         n_id = max(len(ids), 1)
 
-        # Naming conventions
         camel    = sum(1 for t in ids if re.search(r'[a-z][A-Z]', t))
         snake    = sum(1 for t in ids if '_' in t and t != '_')
         all_caps = sum(1 for t in ids if t.isupper() and len(t) > 1)
         features += [camel / n_id, snake / n_id, all_caps / n_id]
 
-        # Keyword frequencies
         tok_counts  = Counter(tokens)
         total_toks  = max(len(tokens), 1)
         for kw in self.KEYWORDS:
             features.append(tok_counts.get(kw, 0) / total_toks)
 
-        # For-vs-while ratio
         n_for   = tok_counts.get('for', 0)
         n_while = tok_counts.get('while', 0)
         features.append(n_for / max(n_for + n_while, 1))
 
-        # Indentation style
         indented = [l for l in lines if l and l[0] in (' ', '\t')]
         n_ind    = max(len(indented), 1)
         tab_rate   = sum(1 for l in indented if l[0] == '\t') / n_ind
@@ -150,14 +101,12 @@ class LexicalFeatureExtractor:
         avg_indent = (np.mean(depths) / 8.0) if depths else 0.0
         features += [tab_rate, space_rate, min(avg_indent, 1.0)]
 
-        # Comment style
         n_lines = max(len(lines), 1)
         features += [
             sum(1 for l in lines if '//' in l) / n_lines,
             code.count('/*') / n_lines,
         ]
 
-        # Line-length stats
         lengths = [len(l) for l in lines if l.strip()]
         if lengths:
             features += [
@@ -168,17 +117,14 @@ class LexicalFeatureExtractor:
         else:
             features += [0.0, 0.0, 0.0]
 
-        # Syntactic density
         n_chars = max(len(code), 1)
         features += [
             code.count('{') / n_chars * 100,
             code.count(';') / n_chars * 100,
         ]
 
-        # Blank-line ratio
         features.append(sum(1 for l in lines if not l.strip()) / n_lines)
 
-        # Short-identifier ratio
         features.append(sum(1 for t in ids if len(t) <= 2) / n_id)
 
         return features
@@ -187,10 +133,6 @@ class LexicalFeatureExtractor:
     def feature_dim(self) -> int:
         return 3 + len(self.KEYWORDS) + 1 + 3 + 2 + 3 + 2 + 1 + 1
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Character-Level Vocabulary  (from sequential.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CharVocabulary:
     PAD = '<PAD>'
@@ -217,10 +159,6 @@ class CharVocabulary:
         return len(self.char2idx)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Attention Pooling  (from sequential.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class AttentionPooling(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -234,19 +172,7 @@ class AttentionPooling(nn.Module):
         return context
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Embedding Network
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CodeEmbeddingNet(nn.Module):
-    """
-    Bi-LSTM + Attention Pooling → Projection MLP → L2-normalised embedding.
-
-    The backbone (embedding + LSTM + attention) is structurally identical to
-    BiLSTMStyleClassifier from sequential.py, but the classifier head is
-    replaced with a metric-learning projection head.
-    """
-
     def __init__(
         self,
         vocab_size:      int,
@@ -261,7 +187,6 @@ class CodeEmbeddingNet(nn.Module):
 
         self.lex_feature_dim = lex_feature_dim
 
-        # ── Backbone (same as BiLSTMStyleClassifier) ──────────────────────
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
 
         self.lstm = nn.LSTM(
@@ -278,7 +203,6 @@ class CodeEmbeddingNet(nn.Module):
 
         fusion_dim = lstm_out_dim + lex_feature_dim
 
-        # ── Projection head (replaces classifier) ─────────────────────────
         self.projector = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(fusion_dim, hidden_dim),
@@ -303,7 +227,6 @@ class CodeEmbeddingNet(nn.Module):
         lengths:   torch.Tensor,
         lex_feats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns L2-normalised embeddings [B, projection_dim]."""
         _, T = token_ids.shape
 
         embedded = self.embedding(token_ids)
@@ -329,7 +252,6 @@ class CodeEmbeddingNet(nn.Module):
         return F.normalize(proj, p=2, dim=-1)
 
     def load_pretrained_backbone(self, checkpoint_path: str, device: str) -> None:
-        """Load weights from a trained BiLSTMStyleClassifier checkpoint."""
         if not os.path.exists(checkpoint_path):
             print(f"  ⚠ Pretrained checkpoint not found: {checkpoint_path}")
             return
@@ -337,11 +259,9 @@ class CodeEmbeddingNet(nn.Module):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state = ckpt.get('model_state', ckpt)
 
-        # Map classifier-model keys → embedding-model keys
         loaded = 0
         own_state = self.state_dict()
         for key, value in state.items():
-            # Skip classifier head weights — we have our own projector
             if key.startswith('classifier.'):
                 continue
             if key in own_state and own_state[key].shape == value.shape:
@@ -352,16 +272,7 @@ class CodeEmbeddingNet(nn.Module):
         print(f"  ✓ Loaded {loaded} parameter tensors from pretrained checkpoint")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Smart Data Selection
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MetricLearningDataset(Dataset):
-    """
-    Base dataset that stores code samples indexed by author for efficient
-    mining.  Each __getitem__ returns a single encoded sample with its label.
-    """
-
     def __init__(
         self,
         codes:         List[str],
@@ -376,7 +287,6 @@ class MetricLearningDataset(Dataset):
         self.lex_extractor = lex_extractor
         self.max_seq_len   = max_seq_len
 
-        # Build per-author index for fast mining
         self.label_to_indices: Dict[int, List[int]] = defaultdict(list)
         for idx, lbl in enumerate(labels):
             self.label_to_indices[lbl].append(idx)
@@ -403,14 +313,6 @@ class MetricLearningDataset(Dataset):
 
 
 class ClassBalancedBatchSampler(Sampler):
-    """
-    Yields batches of P × K indices: P randomly chosen authors, K randomly
-    chosen samples per author.  This ensures every batch has rich same-author
-    and different-author pairs for in-batch mining.
-
-    If an author has fewer than K samples, we sample with replacement.
-    """
-
     def __init__(
         self,
         label_to_indices: Dict[int, List[int]],
@@ -426,7 +328,6 @@ class ClassBalancedBatchSampler(Sampler):
 
     def __iter__(self):
         for _ in range(self.num_batches):
-            # Choose P authors
             chosen = random.sample(
                 self.unique_labels, min(self.P, len(self.unique_labels))
             )
@@ -445,11 +346,6 @@ class ClassBalancedBatchSampler(Sampler):
 
 
 class VerificationPairDataset(Dataset):
-    """
-    For evaluation: yields balanced positive (same-author) and negative
-    (different-author) pairs with a binary label.
-    """
-
     def __init__(
         self,
         codes:         List[str],
@@ -471,22 +367,19 @@ class VerificationPairDataset(Dataset):
         for idx, lbl in enumerate(labels):
             label_to_indices[lbl].append(idx)
 
-        # Authors with ≥2 samples (needed for positive pairs)
         eligible = {k: v for k, v in label_to_indices.items() if len(v) >= 2}
         eligible_labels = list(eligible.keys())
 
-        self.pairs: List[Tuple[int, int, int]] = []   # (idx_a, idx_b, same?)
+        self.pairs: List[Tuple[int, int, int]] = []
 
         n_pos = num_pairs // 2
         n_neg = num_pairs - n_pos
 
-        # ── Positive pairs ────────────────────────────────────────────────
         for _ in range(n_pos):
             lbl = rng.choice(eligible_labels)
             a, b = rng.sample(eligible[lbl], 2)
             self.pairs.append((a, b, 1))
 
-        # ── Negative pairs (hard: from similar-sized author pools) ────────
         for _ in range(n_neg):
             l1, l2 = rng.sample(eligible_labels, 2)
             a = rng.choice(eligible[l1])
@@ -523,21 +416,11 @@ class VerificationPairDataset(Dataset):
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss Functions with Online Mining
-# ─────────────────────────────────────────────────────────────────────────────
-
 def pairwise_distances(embeddings: torch.Tensor) -> torch.Tensor:
-    """
-    Compute pairwise cosine distance matrix [B, B].
-    Distance = 1 - cosine_similarity, range [0, 2].
-    Natural for L2-normalised embeddings and numerically stable.
-    """
-    # For L2-normalised vectors: cosine_sim = dot product
-    sim = embeddings @ embeddings.t()                     # [B, B]
-    sim = torch.clamp(sim, -1.0, 1.0)                    # numerical safety
-    D   = 1.0 - sim                                       # [B, B] in [0, 2]
-    D   = torch.clamp(D, min=0.0)                         # ensure non-negative
+    sim = embeddings @ embeddings.t()
+    sim = torch.clamp(sim, -1.0, 1.0)
+    D   = 1.0 - sim
+    D   = torch.clamp(D, min=0.0)
     return D
 
 
@@ -546,31 +429,19 @@ def online_triplet_loss(
     labels:     torch.Tensor,
     margin:     float = 1.0,
 ) -> Tuple[torch.Tensor, int]:
-    """
-    Batch-all triplet loss with semi-hard mining.
-
-    For every valid (anchor, positive, negative) triplet in the batch:
-      - Positive: same label as anchor
-      - Negative: different label from anchor
-      - Semi-hard: d(a,p) < d(a,n) < d(a,p) + margin
-
-    Falls back to hard negatives if no semi-hard triplets exist.
-    """
     D = pairwise_distances(embeddings)
     B = embeddings.size(0)
 
-    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)   # [B, B]
+    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
 
     loss  = torch.tensor(0.0, device=embeddings.device)
     count = 0
 
     for i in range(B):
-        # Positive indices (same label, not self)
         pos_mask = labels_eq[i].clone()
         pos_mask[i] = False
         pos_indices = pos_mask.nonzero(as_tuple=True)[0]
 
-        # Negative indices (different label)
         neg_mask    = ~labels_eq[i]
         neg_indices = neg_mask.nonzero(as_tuple=True)[0]
 
@@ -580,17 +451,14 @@ def online_triplet_loss(
         for p in pos_indices:
             d_ap = D[i, p]
 
-            # Semi-hard negatives: d(a,p) < d(a,n) < d(a,p) + margin
             d_an = D[i, neg_indices]
             semi_hard = (d_an > d_ap) & (d_an < d_ap + margin)
 
             if semi_hard.any():
-                # Pick the hardest among semi-hard (closest to anchor)
                 sh_dists = d_an[semi_hard]
                 hardest_sh = sh_dists.min()
                 triplet_loss = F.relu(d_ap - hardest_sh + margin)
             else:
-                # Fall back to hardest negative overall
                 hardest_neg = d_an.min()
                 triplet_loss = F.relu(d_ap - hardest_neg + margin)
 
@@ -610,13 +478,6 @@ def online_contrastive_loss(
     labels:     torch.Tensor,
     margin:     float = 1.0,
 ) -> Tuple[torch.Tensor, int]:
-    """
-    Batch-all contrastive loss with hard pair mining.
-
-    For positive pairs (same label): penalise large distances.
-    For negative pairs (different label): penalise distances < margin.
-    Only considers the hardest pairs per sample for efficiency.
-    """
     D = pairwise_distances(embeddings)
     B = embeddings.size(0)
 
@@ -626,7 +487,6 @@ def online_contrastive_loss(
     count = 0
 
     for i in range(B):
-        # Hardest positive: same label, farthest away
         pos_mask = labels_eq[i].clone()
         pos_mask[i] = False
         pos_indices = pos_mask.nonzero(as_tuple=True)[0]
@@ -653,12 +513,7 @@ def online_contrastive_loss(
     return loss, count
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Collate Functions
-# ─────────────────────────────────────────────────────────────────────────────
-
 def metric_collate(batch: List[dict], use_lex: bool) -> dict:
-    """Collate for MetricLearningDataset (single samples with labels)."""
     token_ids = torch.stack([b['token_ids'] for b in batch])
     lengths   = torch.tensor(
         [b['length'] for b in batch], dtype=torch.long
@@ -671,7 +526,6 @@ def metric_collate(batch: List[dict], use_lex: bool) -> dict:
 
 
 def pair_collate(batch: List[dict], use_lex: bool) -> dict:
-    """Collate for VerificationPairDataset."""
     a_ids = torch.stack([b['a_token_ids'] for b in batch])
     a_len = torch.tensor(
         [b['a_length'] for b in batch], dtype=torch.long
@@ -692,10 +546,6 @@ def pair_collate(batch: List[dict], use_lex: bool) -> dict:
         out['b_lex_feats'] = torch.stack([b['b_lex_feats'] for b in batch])
     return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data Loading  (from sequential.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_data(config: SiameseConfig):
     import glob as _glob
@@ -753,31 +603,10 @@ def stratified_split(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluation Metrics
-# ─────────────────────────────────────────────────────────────────────────────
-
 def compute_eer(
     similarities: np.ndarray,
     labels:       np.ndarray,
 ) -> Tuple[float, float]:
-    """
-    Compute Equal Error Rate (EER) and the corresponding threshold.
-
-    EER is the point where FAR == FRR on the DET curve.
-    As threshold increases from -1 → 1:
-      - FAR (false accept rate) DECREASES  (fewer imposters accepted)
-      - FRR (false reject rate) INCREASES  (more genuine pairs rejected)
-    EER is where they cross.
-
-    Args:
-        similarities: cosine similarities between pairs
-        labels:       1 for same-author, 0 for different-author
-
-    Returns:
-        (eer, threshold)
-    """
-    # Sweep thresholds from LOW to HIGH
     thresholds = np.linspace(-1.0, 1.0, 2000)
     pos_mask = labels == 1
     neg_mask = labels == 0
@@ -787,26 +616,18 @@ def compute_eer(
 
     for i, thr in enumerate(thresholds):
         preds = (similarities >= thr).astype(int)
-        # FAR: fraction of different-author pairs INCORRECTLY predicted as same
         fars[i] = preds[neg_mask].mean() if neg_mask.any() else 0.0
-        # FRR: fraction of same-author pairs INCORRECTLY predicted as different
         frrs[i] = 1.0 - preds[pos_mask].mean() if pos_mask.any() else 0.0
 
-    # Find the crossing point: where FAR drops below FRR
-    # At low threshold: FAR ≈ 1, FRR ≈ 0  →  diff = FAR - FRR > 0
-    # At high threshold: FAR ≈ 0, FRR ≈ 1  →  diff = FAR - FRR < 0
     diffs = fars - frrs
 
-    # Find sign change
     for i in range(1, len(diffs)):
         if diffs[i - 1] >= 0 and diffs[i] < 0:
-            # Linear interpolation for the crossing point
             w = diffs[i - 1] / (diffs[i - 1] - diffs[i])
             eer_val = float(fars[i - 1] * (1 - w) + fars[i] * w)
             thr_val = float(thresholds[i - 1] * (1 - w) + thresholds[i] * w)
             return eer_val, thr_val
 
-    # Fallback: find the threshold with minimum |FAR - FRR|
     idx = int(np.argmin(np.abs(diffs)))
     eer_val = float((fars[idx] + frrs[idx]) / 2.0)
     return eer_val, float(thresholds[idx])
@@ -816,7 +637,6 @@ def compute_auc(
     similarities: np.ndarray,
     labels:       np.ndarray,
 ) -> float:
-    """Compute AUC-ROC using the trapezoidal rule (no sklearn needed)."""
     thresholds = np.linspace(1.0, -1.0, 2000)
     tpr_list, fpr_list = [], []
 
@@ -830,17 +650,12 @@ def compute_auc(
         tpr_list.append(tpr)
         fpr_list.append(fpr)
 
-    # Trapezoidal integration
     auc = 0.0
     for i in range(1, len(fpr_list)):
         auc += (fpr_list[i] - fpr_list[i-1]) * (tpr_list[i] + tpr_list[i-1]) / 2.0
 
     return abs(auc)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Training
-# ─────────────────────────────────────────────────────────────────────────────
 
 def train_epoch(
     model:     CodeEmbeddingNet,
@@ -850,10 +665,6 @@ def train_epoch(
     device:    str,
     use_lex:   bool,
 ) -> Tuple[float, float, float]:
-    """
-    One training epoch with online triplet + contrastive loss.
-    Returns (combined_loss, triplet_loss, contrastive_loss).
-    """
     model.train()
     total_loss, total_tri, total_con = 0.0, 0.0, 0.0
     n_batches = 0
@@ -870,17 +681,14 @@ def train_epoch(
 
         embeddings = model(token_ids, lengths, lex_feats)
 
-        # ── Triplet loss (online semi-hard mining) ────────────────────
         tri_loss, tri_count = online_triplet_loss(
             embeddings, labels, margin=config.MARGIN_TRIPLET
         )
 
-        # ── Contrastive loss (online hard mining) ─────────────────────
         con_loss, con_count = online_contrastive_loss(
             embeddings, labels, margin=config.MARGIN_CONTRASTIVE
         )
 
-        # ── Combined ──────────────────────────────────────────────────
         alpha = config.LOSS_WEIGHT_TRIPLET
         loss  = alpha * tri_loss + (1 - alpha) * con_loss
 
@@ -905,10 +713,6 @@ def evaluate_verification(
     device:  str,
     use_lex: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute cosine similarities and labels for all verification pairs.
-    Returns (similarities, labels) as numpy arrays.
-    """
     model.eval()
     all_sims   = []
     all_labels = []
@@ -936,10 +740,6 @@ def evaluate_verification(
     return np.array(all_sims), np.array(all_labels)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PCA Embedding Visualization
-# ─────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def extract_all_embeddings(
     model:  CodeEmbeddingNet,
@@ -947,7 +747,6 @@ def extract_all_embeddings(
     config: SiameseConfig,
     device: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract embeddings for all samples in a dataset."""
     model.eval()
     loader = DataLoader(
         ds,
@@ -975,22 +774,16 @@ def extract_all_embeddings(
 
 
 def pca_2d(embeddings: np.ndarray) -> np.ndarray:
-    """Apply PCA to reduce embeddings to 2D (no sklearn dependency)."""
-    # Center the data
     mean = embeddings.mean(axis=0)
     centered = embeddings - mean
 
-    # Covariance matrix
     cov = np.cov(centered, rowvar=False)
 
-    # Eigenvalue decomposition
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
 
-    # Sort by descending eigenvalue
     idx = np.argsort(eigenvalues)[::-1]
     top_2 = eigenvectors[:, idx[:2]]
 
-    # Project
     return centered @ top_2
 
 
@@ -1003,13 +796,9 @@ def visualize_embeddings(
     device:     str,
     max_samples: int = 1500,
 ) -> None:
-    """
-    Extract embeddings, apply PCA, and save a scatter plot colored by author.
-    """
     print(f"  Extracting embeddings ({tag}) ...")
     embs, labels = extract_all_embeddings(model, ds, config, device)
 
-    # Subsample if too many for clear visualization
     if len(embs) > max_samples:
         rng = np.random.RandomState(42)
         idx = rng.choice(len(embs), max_samples, replace=False)
@@ -1023,7 +812,6 @@ def visualize_embeddings(
     unique_labels = sorted(set(labels.tolist()))
     n_authors = len(unique_labels)
 
-    # Generate a nice colormap
     cmap = plt.cm.get_cmap('tab20', n_authors)
 
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -1054,10 +842,6 @@ def visualize_embeddings(
     print(f"  ✓ Saved → {save_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Siamese Metric Learning for Code Authorship Verification")
     parser.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
@@ -1070,7 +854,6 @@ def main():
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
 
-    # ── Reproducibility ───────────────────────────────────────────────────
     torch.manual_seed(config.SEED)
     random.seed(config.SEED)
     np.random.seed(config.SEED)
@@ -1086,14 +869,12 @@ def main():
     print(f"Loss mix    : α={config.LOSS_WEIGHT_TRIPLET} triplet + "
           f"{1-config.LOSS_WEIGHT_TRIPLET} contrastive\n")
 
-    # ── 1. Load data ──────────────────────────────────────────────────────
     df, top_authors, author2idx = load_data(config)
     train_df, val_df, test_df = stratified_split(
         df, config.SEED, config.VAL_RATIO, config.TEST_RATIO
     )
     print(f"\nSplit → train: {len(train_df)}  val: {len(val_df)}  test: {len(test_df)}\n")
 
-    # ── 2. Vocabulary ─────────────────────────────────────────────────────
     vocab = CharVocabulary()
     vocab.build(train_df[config.CODE_COLUMN].tolist(), max_vocab=config.VOCAB_SIZE)
     print(f"Vocabulary size    : {len(vocab)}")
@@ -1102,7 +883,6 @@ def main():
     lex_dim       = lex_extractor.feature_dim if lex_extractor else 0
     print(f"Lexical feat dim   : {lex_dim}")
 
-    # ── 3. Datasets ───────────────────────────────────────────────────────
     train_ds = MetricLearningDataset(
         codes         = train_df[config.CODE_COLUMN].tolist(),
         labels        = train_df['label'].tolist(),
@@ -1111,7 +891,6 @@ def main():
         max_seq_len   = config.MAX_SEQ_LEN,
     )
 
-    # Class-balanced batch sampler for training
     n_train_batches = max(len(train_ds) // config.BATCH_SIZE, 20)
     batch_sampler = ClassBalancedBatchSampler(
         label_to_indices  = train_ds.label_to_indices,
@@ -1127,7 +906,6 @@ def main():
         num_workers   = 2,
     )
 
-    # Verification pair datasets for val and test
     val_pair_ds = VerificationPairDataset(
         codes         = val_df[config.CODE_COLUMN].tolist(),
         labels        = val_df['label'].tolist(),
@@ -1162,7 +940,6 @@ def main():
         num_workers= 2,
     )
 
-    # ── 4. Model ──────────────────────────────────────────────────────────
     model = CodeEmbeddingNet(
         vocab_size      = len(vocab),
         embed_dim       = config.CHAR_EMBED_DIM,
@@ -1173,7 +950,6 @@ def main():
         projection_dim  = config.PROJECTION_DIM,
     ).to(config.DEVICE)
 
-    # Try loading pretrained backbone
     print(f"\nAttempting to load pretrained backbone from: {config.PRETRAINED_PATH}")
     model.load_pretrained_backbone(config.PRETRAINED_PATH, config.DEVICE)
 
@@ -1181,7 +957,6 @@ def main():
     print(f"Model parameters   : {n_params:,}\n")
     print(model)
 
-    # ── PCA visualization BEFORE training ─────────────────────────────────
     print("\n─── PCA Visualization: Before Training ─────────────────────────")
     visualize_embeddings(
         model      = model,
@@ -1192,12 +967,10 @@ def main():
         device     = config.DEVICE,
     )
 
-    # ── 5. Two-phase training ─────────────────────────────────────────────
     best_eer       = 1.0
     best_threshold = 0.5
     best_state     = None
 
-    # ── Phase 1: Warm-up (freeze backbone, train projector only) ──────
     warmup_epochs = min(config.WARMUP_EPOCHS, config.EPOCHS)
 
     if warmup_epochs > 0 and os.path.exists(config.PRETRAINED_PATH):
@@ -1232,11 +1005,9 @@ def main():
                   f"Loss: {tr_loss:.4f} (T:{tr_tri:.4f} C:{tr_con:.4f})  "
                   f"EER: {eer:.4f}  Thr: {thr:.3f}{marker}")
 
-        # Unfreeze all
         for param in model.parameters():
             param.requires_grad = True
 
-    # ── Phase 2: Full fine-tuning ─────────────────────────────────────
     remaining = config.EPOCHS - warmup_epochs if os.path.exists(config.PRETRAINED_PATH) else config.EPOCHS
     print(f"\n─── Phase 2: Full training ({remaining} epochs) ──────────────────")
 
@@ -1286,7 +1057,6 @@ def main():
             print(f"\n  Early stopping at epoch {epoch} (patience={patience})")
             break
 
-    # ── 6. Restore best and evaluate on test ──────────────────────────────
     print(f"\nBest validation EER  : {best_eer:.4f}")
     print(f"Best threshold       : {best_threshold:.3f}")
 
@@ -1302,11 +1072,9 @@ def main():
     eer_test, thr_test = compute_eer(sims, labels)
     auc_test           = compute_auc(sims, labels)
 
-    # Accuracy at best threshold
     preds   = (sims >= best_threshold).astype(int)
     acc     = (preds == labels).mean()
 
-    # Stats
     pos_sims = sims[labels == 1]
     neg_sims = sims[labels == 0]
 
@@ -1317,7 +1085,6 @@ def main():
     print(f"  Diff-author sims   : mean={neg_sims.mean():.4f}  std={neg_sims.std():.4f}")
     print(f"  Separation gap     : {pos_sims.mean() - neg_sims.mean():.4f}")
 
-    # Per-threshold breakdown
     print(f"\n  {'Threshold':>10}  {'Accuracy':>8}  {'FAR':>6}  {'FRR':>6}")
     print("  " + "─" * 36)
     for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
@@ -1327,7 +1094,6 @@ def main():
         frr = 1.0 - p[labels == 1].mean() if (labels == 1).any() else 0.0
         print(f"  {t:>10.1f}  {a:>8.4f}  {far:>6.4f}  {frr:>6.4f}")
 
-    # ── 7. Save checkpoint ────────────────────────────────────────────────
     os.makedirs("model", exist_ok=True)
     save_path = os.path.join("model", "siamese_verification.pt")
     torch.save({
@@ -1342,7 +1108,6 @@ def main():
     }, save_path)
     print(f"\n✓ Checkpoint saved → {save_path}")
 
-    # ── 8. PCA Embedding Visualizations ────────────────────────────────────
     print("\n─── Generating PCA Embedding Visualizations ────────────────────")
     visualize_embeddings(
         model      = model,
@@ -1353,7 +1118,6 @@ def main():
         device     = config.DEVICE,
     )
 
-    # ── 9. Demo: Verification function ────────────────────────────────────
     print("\n─── Verification Demo ──────────────────────────────────────────")
     print("Usage after loading checkpoint:")
     print("  model, vocab, lex_ext, threshold = load_verifier('model/siamese_verification.pt')")
@@ -1361,14 +1125,9 @@ def main():
     print("=" * 65)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference API
-# ─────────────────────────────────────────────────────────────────────────────
-
 def load_verifier(
     path: str, device: str = "cpu",
 ) -> Tuple[CodeEmbeddingNet, CharVocabulary, Optional[LexicalFeatureExtractor], float]:
-    """Load a trained verification model from a checkpoint."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg  = ckpt['config']
 
@@ -1404,7 +1163,6 @@ def get_embedding(
     max_len:   int  = 2000,
     device:    str  = "cpu",
 ) -> torch.Tensor:
-    """Get the L2-normalised embedding for a single code snippet."""
     token_ids, length = vocab.encode(code, max_len)
     token_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
     lengths   = torch.tensor([max(length, 1)], dtype=torch.long, device=device)
@@ -1427,14 +1185,6 @@ def verify(
     max_len:   int = 2000,
     device:    str = "cpu",
 ) -> Tuple[bool, float]:
-    """
-    Verify whether two code snippets were written by the same author.
-
-    Returns:
-        (same_author, confidence)
-        - same_author: True if predicted same author
-        - confidence:  cosine similarity ∈ [-1, 1]
-    """
     emb_a = get_embedding(model, vocab, lex_ext, code_a, max_len, device)
     emb_b = get_embedding(model, vocab, lex_ext, code_b, max_len, device)
     sim   = F.cosine_similarity(emb_a.unsqueeze(0), emb_b.unsqueeze(0)).item()
