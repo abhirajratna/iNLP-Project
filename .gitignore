@@ -4,3 +4,4 @@ datasets/
 vscode/
 __pycache__/
 *.log
+*.csv

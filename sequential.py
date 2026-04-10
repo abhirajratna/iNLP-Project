@@ -21,6 +21,9 @@ class Config:
     MAX_SEQ_LEN = 2000
 
     USE_LEXICAL_FEATURES = True
+    # If True, force using datasets/ai_hum.csv and map anything not labelled
+    # 'human' in that file to the 'ai' class. When False runs normal author classifier.
+    AI_MODE = True
 
     VOCAB_SIZE = 200
     EMBED_DIM = 64
@@ -312,21 +315,75 @@ class BiLSTMStyleClassifier(nn.Module):
 def load_data(config: Config):
     print(f"Loading from: {config.DATA_PATH}")
 
-    if os.path.isdir(config.DATA_PATH):
-        import glob
+    # If AI_MODE is enabled, force-load the ai_hum.csv file and convert
+    # all non-'human' labels to 'ai'. Otherwise preserve existing behavior
+    # (load CSV(s) from DATA_PATH).
+    if getattr(config, "AI_MODE", False):
+        # prefer dataset path inside DATA_PATH directory
+        ai_path = (
+            os.path.join(config.DATA_PATH, "ai_hum.csv")
+            if os.path.isdir(config.DATA_PATH)
+            else config.DATA_PATH
+        )
+        if not os.path.exists(ai_path):
+            raise FileNotFoundError(f"ai_hum.csv not found at: {ai_path}")
+        print(f"  AI mode enabled — reading: {ai_path}")
+        df = pd.read_csv(ai_path)
 
-        csv_files = sorted(glob.glob(os.path.join(config.DATA_PATH, "*.csv")))
-        if not csv_files:
-            raise FileNotFoundError(
-                f"No CSV files found in directory: {config.DATA_PATH}"
+        # Ensure source code column exists — if not, try common fallbacks
+        if config.CODE_COLUMN not in df.columns:
+            for c in ["flines", "code", "text", "content"]:
+                if c in df.columns:
+                    df[config.CODE_COLUMN] = df[c].astype(str)
+                    break
+            else:
+                raise ValueError(
+                    f"Could not find a code column in {ai_path}; expected {config.CODE_COLUMN} or a common fallback."
+                )
+
+        # Find a column that contains human/ai annotations. Prefer any
+        # column that contains the string 'human' in at least one row.
+        label_col = None
+        for c in df.columns:
+            try:
+                if df[c].astype(str).str.lower().isin(["human"]).any():
+                    label_col = c
+                    break
+            except Exception:
+                continue
+
+        # Fallback to common label column names
+        if label_col is None:
+            for c in ["label", "class", "annot", "source", "kind"]:
+                if c in df.columns:
+                    label_col = c
+                    break
+
+        if label_col is None:
+            raise ValueError(
+                f"Could not find human/ai label column in {ai_path}; please include a column with 'human' labels."
             )
-        parts = []
-        for f in csv_files:
-            print(f"  reading: {f}")
-            parts.append(pd.read_csv(f))
-        df = pd.concat(parts, ignore_index=True)
+
+        # Map labels: 'human' -> 'human', everything else -> 'ai'
+        df[config.AUTHOR_COLUMN] = (
+            df[label_col].astype(str).apply(lambda x: "human" if x.lower() == "human" else "ai")
+        )
     else:
-        df = pd.read_csv(config.DATA_PATH)
+        if os.path.isdir(config.DATA_PATH):
+            import glob
+
+            csv_files = sorted(glob.glob(os.path.join(config.DATA_PATH, "*.csv")))
+            if not csv_files:
+                raise FileNotFoundError(
+                    f"No CSV files found in directory: {config.DATA_PATH}"
+                )
+            parts = []
+            for f in csv_files:
+                print(f"  reading: {f}")
+                parts.append(pd.read_csv(f))
+            df = pd.concat(parts, ignore_index=True)
+        else:
+            df = pd.read_csv(config.DATA_PATH)
 
     df = df.dropna(subset=[config.CODE_COLUMN, config.AUTHOR_COLUMN])
     df[config.CODE_COLUMN] = df[config.CODE_COLUMN].astype(str)
