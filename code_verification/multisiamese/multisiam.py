@@ -18,7 +18,7 @@ class MultiSiamConfig:
     DATA_PATH = "datasets/"
     CODE_COLUMN = "flines"
     AUTHOR_COLUMN = "username"
-    TOP_N_AUTHORS = 20
+    TOP_N_AUTHORS = 30
     MIN_SAMPLES_PER_AUTHOR = 15
     MAX_SEQ_LEN = 1000
 
