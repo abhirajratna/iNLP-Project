@@ -55,8 +55,8 @@ class SiameseConfig:
     WEIGHT_DECAY           = 1e-4
     SEED                   = 42
 
-    VAL_RATIO              = 0.10
-    TEST_RATIO             = 0.10
+    VAL_RATIO              = 0.15
+    TEST_RATIO             = 0.15
 
     PRETRAINED_PATH        = "bilstm_style_classifier.pt"
 
@@ -583,28 +583,54 @@ def load_data(config: SiameseConfig):
     return df, top_authors, author2idx
 
 
-def stratified_split(
-    df: pd.DataFrame, seed: int,
-    val_ratio: float = 0.10, test_ratio: float = 0.10,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def author_disjoint_split(
+    df: pd.DataFrame,
+    author_col: str,
+    seed: int,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int], Dict[str, int], Dict[str, int]]:
+    """Split by *authors*, not by samples.  Returns three DataFrames plus
+    per-split label mappings (author -> contiguous int label).
+
+    Train / val / test contain completely disjoint sets of authors so that
+    verification evaluation is on unseen identities.
+    """
     rng = random.Random(seed)
-    train_idx, val_idx, test_idx = [], [], []
 
-    for label in df['label'].unique():
-        idx = df[df['label'] == label].index.tolist()
-        rng.shuffle(idx)
-        n       = len(idx)
-        n_test  = max(1, int(n * test_ratio))
-        n_val   = max(1, int(n * val_ratio))
-        test_idx  += idx[:n_test]
-        val_idx   += idx[n_test: n_test + n_val]
-        train_idx += idx[n_test + n_val:]
+    authors = sorted(df[author_col].unique())
+    rng.shuffle(authors)
 
-    return (
-        df.loc[train_idx].reset_index(drop=True),
-        df.loc[val_idx  ].reset_index(drop=True),
-        df.loc[test_idx ].reset_index(drop=True),
-    )
+    n         = len(authors)
+    n_test    = max(2, int(n * test_ratio))   # need ≥2 authors for neg pairs
+    n_val     = max(2, int(n * val_ratio))
+    n_train   = n - n_val - n_test
+    assert n_train >= 2, f"Not enough authors to split: {n} total"
+
+    train_authors = authors[:n_train]
+    val_authors   = authors[n_train: n_train + n_val]
+    test_authors  = authors[n_train + n_val:]
+
+    # Build per-split label mappings (contiguous 0..K-1)
+    train_a2i = {a: i for i, a in enumerate(train_authors)}
+    val_a2i   = {a: i for i, a in enumerate(val_authors)}
+    test_a2i  = {a: i for i, a in enumerate(test_authors)}
+
+    def _subset(auth_list, a2i):
+        sub = df[df[author_col].isin(auth_list)].copy()
+        sub['label'] = sub[author_col].map(a2i)
+        return sub.reset_index(drop=True)
+
+    train_df = _subset(train_authors, train_a2i)
+    val_df   = _subset(val_authors,   val_a2i)
+    test_df  = _subset(test_authors,  test_a2i)
+
+    print(f"  Author-disjoint split:")
+    print(f"    Train : {len(train_authors)} authors, {len(train_df)} samples")
+    print(f"    Val   : {len(val_authors)} authors, {len(val_df)} samples")
+    print(f"    Test  : {len(test_authors)} authors, {len(test_df)} samples")
+
+    return train_df, val_df, test_df, train_a2i, val_a2i, test_a2i
 
 
 def compute_eer(
@@ -846,6 +872,214 @@ def visualize_embeddings(
     print(f"  ✓ Saved → {save_path}")
 
 
+@torch.no_grad()
+def cluster_based_verification(
+    model:         CodeEmbeddingNet,
+    test_df:       pd.DataFrame,
+    test_a2i:      Dict[str, int],
+    vocab:         CharVocabulary,
+    lex_extractor: Optional[LexicalFeatureExtractor],
+    config:        SiameseConfig,
+    device:        str,
+    n_enroll:      int = 3,
+    threshold:     Optional[float] = None,
+) -> Tuple[float, float]:
+    """N-vs-1 verification on *unseen* authors.
+
+    For every test author:
+      1. Use `n_enroll` samples to build an author **signature** (mean
+         embedding, L2-normalised).
+      2. Every remaining same-author sample is a **positive probe** — it
+         should be verified (distance < threshold).
+      3. Remaining samples from *other* test authors are **negative probes**
+         — they should be rejected (distance >= threshold).
+
+    This mirrors the real-world scenario: given N known codes from an author,
+    can we verify whether an (N+1)th code was written by them?
+
+    Returns (eer, eer_threshold) so callers can use the optimal threshold.
+    """
+    model.eval()
+    author_col = config.AUTHOR_COLUMN
+    idx2author = {v: k for k, v in test_a2i.items()}
+
+    # ── Build per-author enrollment signatures & probe pools ──────────────
+    signatures:  Dict[int, torch.Tensor] = {}     # label -> L2-normed centroid
+    probe_codes: Dict[int, List[str]]    = {}     # label -> list of probe code strings
+
+    rng = random.Random(config.SEED)
+
+    for author, label in test_a2i.items():
+        author_rows = test_df[test_df[author_col] == author]
+        indices = author_rows.index.tolist()
+        rng.shuffle(indices)
+
+        if len(indices) <= n_enroll:
+            enroll_idx = indices[:-1]
+            probe_idx  = indices[-1:]
+        else:
+            enroll_idx = indices[:n_enroll]
+            probe_idx  = indices[n_enroll:]
+
+        # Build author signature: average N enrollment embeddings
+        ref_embs = []
+        for idx in enroll_idx:
+            code = test_df.loc[idx, config.CODE_COLUMN]
+            emb  = get_embedding(model, vocab, lex_extractor, code,
+                                 config.MAX_SEQ_LEN, device)
+            ref_embs.append(emb)
+        ref_stack = torch.stack(ref_embs)                           # (N, D)
+        ref_stack = F.normalize(ref_stack, p=2, dim=-1)
+        signature = F.normalize(ref_stack.mean(dim=0, keepdim=True), p=2, dim=-1)  # (1, D)
+        signatures[label] = signature
+
+        # Collect probe codes
+        probe_codes[label] = [
+            test_df.loc[idx, config.CODE_COLUMN] for idx in probe_idx
+        ]
+
+    sorted_labels = sorted(signatures.keys())
+
+    # ── Generate verification trials ──────────────────────────────────────
+    # For each author's signature, positive trials come from the same author's
+    # probe codes and negative trials from every other author's probe codes.
+    all_distances: List[float] = []
+    all_gt:        List[int]   = []   # 1 = same author (should accept), 0 = diff (should reject)
+
+    # Per-author bookkeeping
+    per_author_pos_dists: Dict[int, List[float]] = defaultdict(list)
+    per_author_neg_dists: Dict[int, List[float]] = defaultdict(list)
+
+    for claim_label in sorted_labels:
+        sig = signatures[claim_label]  # (1, D)
+
+        # Positive trials: probe codes from the SAME author
+        for code in probe_codes[claim_label]:
+            query_emb = get_embedding(model, vocab, lex_extractor, code,
+                                      config.MAX_SEQ_LEN, device)
+            query_emb = F.normalize(query_emb.unsqueeze(0), p=2, dim=-1)  # (1, D)
+            dist = F.pairwise_distance(sig, query_emb).item()
+            all_distances.append(dist)
+            all_gt.append(1)
+            per_author_pos_dists[claim_label].append(dist)
+
+        # Negative trials: probe codes from OTHER authors
+        for other_label in sorted_labels:
+            if other_label == claim_label:
+                continue
+            for code in probe_codes[other_label]:
+                query_emb = get_embedding(model, vocab, lex_extractor, code,
+                                          config.MAX_SEQ_LEN, device)
+                query_emb = F.normalize(query_emb.unsqueeze(0), p=2, dim=-1)
+                dist = F.pairwise_distance(sig, query_emb).item()
+                all_distances.append(dist)
+                all_gt.append(0)
+                per_author_neg_dists[claim_label].append(dist)
+
+    dists_np = np.array(all_distances)
+    gt_np    = np.array(all_gt)
+
+    # ── Compute EER on distances ──────────────────────────────────────────
+    # Accept if dist < thr → prediction = 1 (same author)
+    thresholds = np.linspace(0.0, 3.0, 3000)
+    pos_mask = gt_np == 1
+    neg_mask = gt_np == 0
+
+    fars = np.zeros(len(thresholds))
+    frrs = np.zeros(len(thresholds))
+    for i, thr in enumerate(thresholds):
+        preds = (dists_np < thr).astype(int)
+        fars[i] = preds[neg_mask].mean() if neg_mask.any() else 0.0
+        frrs[i] = 1.0 - preds[pos_mask].mean() if pos_mask.any() else 0.0
+
+    diffs = fars - frrs
+    eer_val, eer_thr = None, None
+    for i in range(1, len(diffs)):
+        if diffs[i - 1] >= 0 and diffs[i] < 0:
+            w = diffs[i - 1] / (diffs[i - 1] - diffs[i])
+            eer_val = float(fars[i - 1] * (1 - w) + fars[i] * w)
+            eer_thr = float(thresholds[i - 1] * (1 - w) + thresholds[i] * w)
+            break
+    if eer_val is None:
+        idx_best = int(np.argmin(np.abs(diffs)))
+        eer_val = float((fars[idx_best] + frrs[idx_best]) / 2.0)
+        eer_thr = float(thresholds[idx_best])
+
+    # AUC (distance-based: lower distance → more likely same author)
+    sim_scores = -dists_np
+    auc = compute_auc(sim_scores, gt_np)
+
+    # Use provided threshold or EER-optimal threshold
+    thr_use = threshold if threshold is not None else eer_thr
+
+    # ── Apply threshold & compute metrics ─────────────────────────────────
+    preds = (dists_np < thr_use).astype(int)
+    tp = int(((preds == 1) & (gt_np == 1)).sum())
+    fp = int(((preds == 1) & (gt_np == 0)).sum())
+    tn = int(((preds == 0) & (gt_np == 0)).sum())
+    fn = int(((preds == 0) & (gt_np == 1)).sum())
+
+    accuracy  = (tp + tn) / max(tp + tn + fp + fn, 1)
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    pos_dists = dists_np[pos_mask]
+    neg_dists = dists_np[neg_mask]
+
+    # ── Print report ──────────────────────────────────────────────────────
+    n_pos = int(pos_mask.sum())
+    n_neg = int(neg_mask.sum())
+    print(f"\n  N-vs-1 Verification on {len(test_a2i)} unseen authors")
+    print(f"  Enrollment codes/author : {n_enroll}")
+    print(f"  Positive trials (same)  : {n_pos}")
+    print(f"  Negative trials (diff)  : {n_neg}")
+    print(f"  Decision threshold      : {thr_use:.4f}"
+          f"  {'(EER-optimal)' if threshold is None else '(provided)'}")
+
+    print(f"\n  Accuracy   : {accuracy:.4f}")
+    print(f"  Precision  : {precision:.4f}")
+    print(f"  Recall     : {recall:.4f}")
+    print(f"  F1 Score   : {f1:.4f}")
+    print(f"  EER        : {eer_val:.4f}  (at dist threshold {eer_thr:.4f})")
+    print(f"  AUC-ROC    : {auc:.4f}")
+
+    print(f"\n  Same-author dists  : mean={pos_dists.mean():.4f}  std={pos_dists.std():.4f}")
+    print(f"  Diff-author dists  : mean={neg_dists.mean():.4f}  std={neg_dists.std():.4f}")
+    print(f"  Separation gap     : {neg_dists.mean() - pos_dists.mean():.4f}")
+
+    # Per-author breakdown
+    print(f"\n  {'Author':<30s}  {'Pos':>4}  {'Neg':>4}  "
+          f"{'AvgPosDist':>10}  {'AvgNegDist':>10}  {'PosAcc':>6}  {'NegAcc':>6}")
+    print("  " + "─" * 80)
+    for lbl in sorted_labels:
+        p_d = np.array(per_author_pos_dists[lbl]) if per_author_pos_dists[lbl] else np.array([0.0])
+        n_d = np.array(per_author_neg_dists[lbl]) if per_author_neg_dists[lbl] else np.array([0.0])
+        pos_correct = (p_d < thr_use).mean()   # fraction of positives correctly accepted
+        neg_correct = (n_d >= thr_use).mean()   # fraction of negatives correctly rejected
+        print(f"  {idx2author[lbl]:<30s}  {len(per_author_pos_dists[lbl]):>4}  "
+              f"{len(per_author_neg_dists[lbl]):>4}  "
+              f"{p_d.mean():>10.4f}  {n_d.mean():>10.4f}  "
+              f"{pos_correct:>6.3f}  {neg_correct:>6.3f}")
+
+    # Distance-threshold sweep
+    print(f"\n  {'DistThreshold':>13}  {'Accuracy':>8}  {'Precision':>9}  "
+          f"{'Recall':>6}  {'F1':>6}  {'FAR':>6}  {'FRR':>6}")
+    print("  " + "─" * 60)
+    for t in np.arange(0.2, 2.2, 0.2):
+        p   = (dists_np < t).astype(int)
+        a   = (p == gt_np).mean()
+        pr  = p[gt_np == 1].sum() / max(p.sum(), 1)
+        rc  = p[gt_np == 1].mean() if pos_mask.any() else 0.0
+        f1t = 2 * pr * rc / max(pr + rc, 1e-8)
+        far = p[neg_mask].mean() if neg_mask.any() else 0.0
+        frr = 1.0 - p[pos_mask].mean() if pos_mask.any() else 0.0
+        print(f"  {t:>13.2f}  {a:>8.4f}  {pr:>9.4f}  "
+              f"{rc:>6.4f}  {f1t:>6.4f}  {far:>6.4f}  {frr:>6.4f}")
+
+    return eer_val, eer_thr
+
+
 def main():
     parser = argparse.ArgumentParser(description="Siamese Metric Learning for Code Authorship Verification")
     parser.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
@@ -874,10 +1108,18 @@ def main():
           f"{1-config.LOSS_WEIGHT_TRIPLET} contrastive\n")
 
     df, top_authors, author2idx = load_data(config)
-    train_df, val_df, test_df = stratified_split(
-        df, config.SEED, config.VAL_RATIO, config.TEST_RATIO
+
+    # ---- Author-disjoint split -------------------------------------------
+    train_df, val_df, test_df, train_a2i, val_a2i, test_a2i = author_disjoint_split(
+        df,
+        author_col = config.AUTHOR_COLUMN,
+        seed       = config.SEED,
+        val_ratio  = config.VAL_RATIO,
+        test_ratio = config.TEST_RATIO,
     )
-    print(f"\nSplit → train: {len(train_df)}  val: {len(val_df)}  test: {len(test_df)}\n")
+    # For training we use train_a2i; for PCA vis we also need it
+    author2idx = train_a2i
+    print()
 
     vocab = CharVocabulary()
     vocab.build(train_df[config.CODE_COLUMN].tolist(), max_vocab=config.VOCAB_SIZE)
@@ -927,22 +1169,8 @@ def main():
         num_workers= 2,
     )
 
-    test_pair_ds = VerificationPairDataset(
-        codes         = test_df[config.CODE_COLUMN].tolist(),
-        labels        = test_df['label'].tolist(),
-        vocab         = vocab,
-        lex_extractor = lex_extractor,
-        max_seq_len   = config.MAX_SEQ_LEN,
-        num_pairs     = min(3000, len(test_df) * 5),
-        seed          = config.SEED + 1,
-    )
-    test_loader = DataLoader(
-        test_pair_ds,
-        batch_size = 32,
-        shuffle    = False,
-        collate_fn = lambda b: pair_collate(b, config.USE_LEXICAL_FEATURES),
-        num_workers= 2,
-    )
+    # (test_pair_ds / test_loader are built later, after training, using
+    #  unseen test authors — see cluster_based_verification + pairwise test)
 
     model = CodeEmbeddingNet(
         vocab_size      = len(vocab),
@@ -1068,7 +1296,46 @@ def main():
         print("Restoring best checkpoint …")
         model.load_state_dict({k: v.to(config.DEVICE) for k, v in best_state.items()})
 
-    print("\n─── Test Set Evaluation ─────────────────────────────────────────")
+    # ── Pairwise verification on unseen val authors ────────────────────────
+    print("\n─── Pairwise Verification (unseen val authors) ─────────────────")
+    sims, labels = evaluate_verification(
+        model, val_loader, config.DEVICE, config.USE_LEXICAL_FEATURES,
+    )
+    eer_val_pair, thr_val_pair = compute_eer(sims, labels)
+    auc_val_pair               = compute_auc(sims, labels)
+    print(f"  Val-pair EER : {eer_val_pair:.4f}  Thr: {thr_val_pair:.3f}  AUC: {auc_val_pair:.4f}")
+
+    # ── Cluster-based test on completely unseen authors ────────────────────
+    print("\n─── Cluster-Based Test (unseen test authors) ───────────────────")
+    cluster_based_verification(
+        model         = model,
+        test_df       = test_df,
+        test_a2i      = test_a2i,
+        vocab         = vocab,
+        lex_extractor = lex_extractor,
+        config        = config,
+        device        = config.DEVICE,
+        n_enroll      = 3,
+    )
+
+    # ── Also run pairwise test for EER / AUC ──────────────────────────────
+    print("\n─── Pairwise Test (unseen test authors) ────────────────────────")
+    test_pair_ds = VerificationPairDataset(
+        codes         = test_df[config.CODE_COLUMN].tolist(),
+        labels        = test_df['label'].tolist(),
+        vocab         = vocab,
+        lex_extractor = lex_extractor,
+        max_seq_len   = config.MAX_SEQ_LEN,
+        num_pairs     = min(3000, len(test_df) * 5),
+        seed          = config.SEED + 1,
+    )
+    test_loader = DataLoader(
+        test_pair_ds,
+        batch_size = 32,
+        shuffle    = False,
+        collate_fn = lambda b: pair_collate(b, config.USE_LEXICAL_FEATURES),
+        num_workers= 2,
+    )
     sims, labels = evaluate_verification(
         model, test_loader, config.DEVICE, config.USE_LEXICAL_FEATURES,
     )
