@@ -28,8 +28,8 @@ class SiameseConfig:
     DATA_PATH              = "datasets/"
     CODE_COLUMN            = "flines"
     AUTHOR_COLUMN          = "username"
-    TOP_N_AUTHORS          = 40
-    MIN_SAMPLES_PER_AUTHOR = 5
+    TOP_N_AUTHORS          = 50
+    MIN_SAMPLES_PER_AUTHOR = 10
     MAX_SEQ_LEN            = 2000
 
     VOCAB_SIZE             = 200
@@ -48,7 +48,7 @@ class SiameseConfig:
     BATCH_SIZE             = 64
     AUTHORS_PER_BATCH      = 8
     SAMPLES_PER_AUTHOR     = 8
-    EPOCHS                 = 30
+    EPOCHS                 = 50
     WARMUP_EPOCHS          = 3
     LR                     = 1e-3
     LR_FINETUNE            = 3e-4
@@ -667,13 +667,17 @@ def compute_auc(
     similarities: np.ndarray,
     labels:       np.ndarray,
 ) -> float:
-    thresholds = np.linspace(1.0, -1.0, 2000)
+    # Use data-adaptive range so it works for both cosine sims and negated distances
+    lo = float(similarities.min()) - 0.01
+    hi = float(similarities.max()) + 0.01
+    thresholds = np.linspace(hi, lo, 2000)
     tpr_list, fpr_list = [], []
+
+    pos_mask = labels == 1
+    neg_mask = labels == 0
 
     for thr in thresholds:
         preds = (similarities >= thr).astype(int)
-        pos_mask = labels == 1
-        neg_mask = labels == 0
 
         tpr = preds[pos_mask].mean() if pos_mask.any() else 0.0
         fpr = preds[neg_mask].mean() if neg_mask.any() else 0.0
@@ -1205,7 +1209,7 @@ def main():
 
     warmup_epochs = min(config.WARMUP_EPOCHS, config.EPOCHS)
 
-    if warmup_epochs > 0 and os.path.exists(config.PRETRAINED_PATH):
+    if warmup_epochs > 0:
         print("\n─── Phase 1: Warm-up (projector only) ────────────────────────")
 
         for name, param in model.named_parameters():
@@ -1240,19 +1244,24 @@ def main():
         for param in model.parameters():
             param.requires_grad = True
 
-    remaining = config.EPOCHS - warmup_epochs if os.path.exists(config.PRETRAINED_PATH) else config.EPOCHS
+    remaining = config.EPOCHS - warmup_epochs
     print(f"\n─── Phase 2: Full training ({remaining} epochs) ──────────────────")
 
+    base_lr = config.LR_FINETUNE if os.path.exists(config.PRETRAINED_PATH) else config.LR
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=config.LR_FINETUNE if os.path.exists(config.PRETRAINED_PATH) else config.LR,
+        lr=base_lr,
         weight_decay=config.WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=remaining, eta_min=1e-6,
-    )
+    # Linear warmup for 5 epochs, then cosine decay
+    lr_warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < lr_warmup_epochs:
+            return (epoch + 1) / lr_warmup_epochs  # ramp 0.2 → 1.0
+        return 0.5 * (1 + math.cos(math.pi * (epoch - lr_warmup_epochs) / max(remaining - lr_warmup_epochs, 1)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    patience     = 7
+    patience     = 10
     patience_ctr = 0
 
     col = 78
@@ -1315,7 +1324,7 @@ def main():
         lex_extractor = lex_extractor,
         config        = config,
         device        = config.DEVICE,
-        n_enroll      = 3,
+        n_enroll      = 5,
     )
 
     # ── Also run pairwise test for EER / AUC ──────────────────────────────
