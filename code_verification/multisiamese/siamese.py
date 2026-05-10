@@ -2,6 +2,7 @@ import os
 import re
 import random
 import numpy as np
+import csv
 import pandas as pd
 from collections import Counter
 from typing import Dict, List, Tuple, Optional
@@ -11,14 +12,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from sklearn.metrics import f1_score
 
 
 class SiameseConfig:
     DATA_PATH = "datasets/"
     CODE_COLUMN = "flines"
     AUTHOR_COLUMN = "username"
-    TOP_N_AUTHORS = 20
-    MIN_SAMPLES_PER_AUTHOR = 10  # Increased for meaningful pairs
+    TOP_N_AUTHORS = 50
+    MIN_SAMPLES_PER_AUTHOR = 15  # Increased for meaningful pairs
     MAX_SEQ_LEN = 1000
 
     USE_LEXICAL_FEATURES = True
@@ -29,7 +31,7 @@ class SiameseConfig:
     DROPOUT = 0.3
     BIDIRECTIONAL = True
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 16
     EPOCHS = 15
     LR = 5e-4  # Lower LR for siamese
     WEIGHT_DECAY = 1e-4
@@ -295,13 +297,40 @@ class ContrastiveLoss(nn.Module):
 
 
 def load_raw_data(config: SiameseConfig):
+    csv.field_size_limit(10 * 1024 * 1024)
+    usecols = [config.CODE_COLUMN, config.AUTHOR_COLUMN]
     if os.path.isdir(config.DATA_PATH):
         import glob
         csv_files = sorted(glob.glob(os.path.join(config.DATA_PATH, "*.csv")))
-        parts = [pd.read_csv(f) for f in csv_files]
-        df = pd.concat(parts, ignore_index=True)
+        chunks = []
+        for f in csv_files:
+            try:
+                for chunk in pd.read_csv(
+                    f,
+                    engine="python",
+                    on_bad_lines="skip",
+                    usecols=usecols,
+                    chunksize=50000,
+                ):
+                    chunks.append(chunk)
+            except ValueError:
+                # Skip files missing required columns
+                continue
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=usecols)
     else:
-        df = pd.read_csv(config.DATA_PATH)
+        chunks = []
+        for chunk in pd.read_csv(
+            config.DATA_PATH,
+            engine="python",
+            on_bad_lines="skip",
+            usecols=usecols,
+            chunksize=50000,
+        ):
+            chunks.append(chunk)
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=usecols)
+
+    if df.empty:
+        raise ValueError("No usable data found with required columns.")
 
     df = df.dropna(subset=[config.CODE_COLUMN, config.AUTHOR_COLUMN])
     df[config.CODE_COLUMN] = df[config.CODE_COLUMN].astype(str)
@@ -312,6 +341,21 @@ def load_raw_data(config: SiameseConfig):
     author2idx = {a: i for i, a in enumerate(top_authors)}
     df["label"] = df[config.AUTHOR_COLUMN].map(author2idx)
     return df, author2idx
+
+
+def split_by_author(df: pd.DataFrame, val_ratio: float, test_ratio: float, seed: int):
+    authors = df["label"].unique().tolist()
+    rng = random.Random(seed)
+    rng.shuffle(authors)
+    n = len(authors)
+    n_val, n_test = int(n * val_ratio), int(n * test_ratio)
+    val_authors = set(authors[:n_val])
+    test_authors = set(authors[n_val:n_val + n_test])
+    train_authors = set(authors[n_val + n_test:])
+    train_df = df[df["label"].isin(train_authors)].copy()
+    val_df = df[df["label"].isin(val_authors)].copy()
+    test_df = df[df["label"].isin(test_authors)].copy()
+    return train_df, val_df, test_df
 
 
 def train_siamese_epoch(model, loader, optimizer, criterion, device):
@@ -333,7 +377,7 @@ def train_siamese_epoch(model, loader, optimizer, criterion, device):
 
 
 @torch.no_grad()
-def evaluate_siamese(model, loader, device, margin=1.0):
+def evaluate_siamese(model, loader, device, threshold: Optional[float] = None, margin: float = 1.0):
     model.eval()
     dists, targets = [], []
     for batch in loader:
@@ -347,10 +391,40 @@ def evaluate_siamese(model, loader, device, margin=1.0):
     
     dists = np.array(dists)
     targets = np.array(targets)
-    # Simple accuracy based on margin/2 threshold
-    preds = (dists < (margin / 2)).astype(float)
+    if threshold is None:
+        threshold = margin / 2
+    preds = (dists < threshold).astype(float)
     acc = (preds == targets).mean()
     return acc
+
+
+@torch.no_grad()
+def find_best_threshold_siamese(model, loader, device, num_steps: int = 50) -> Tuple[float, float]:
+    model.eval()
+    dists, targets = [], []
+    for batch in loader:
+        x1 = {k: v.to(device) for k, v in batch["x1"].items()}
+        x2 = {k: v.to(device) for k, v in batch["x2"].items()}
+        target = batch["target"].to(device)
+        out1 = model(**x1)
+        out2 = model(**x2)
+        dists.extend(F.pairwise_distance(out1, out2).cpu().tolist())
+        targets.extend(target.cpu().tolist())
+
+    if not dists:
+        return 0.5, 0.0
+
+    d_min, d_max = min(dists), max(dists)
+    thresholds = np.linspace(d_min, d_max, num_steps)
+    best_f1 = 0.0
+    best_t = 0.5
+    for t in thresholds:
+        preds = [1 if d < t else 0 for d in dists]
+        f1 = f1_score(targets, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = t
+    return best_t, best_f1
 
 
 class VerificationSystem:
@@ -395,25 +469,13 @@ class VerificationSystem:
 
 def main():
     config = SiameseConfig()
+    random.seed(config.SEED)
+    np.random.seed(config.SEED)
     torch.manual_seed(config.SEED)
     
     df, author2idx = load_raw_data(config)
     
-    # Split
-    authors = df["label"].unique()
-    train_indices, val_indices, test_indices = [], [], []
-    for a in authors:
-        idx = df[df["label"] == a].index.tolist()
-        random.shuffle(idx)
-        n = len(idx)
-        n_val, n_test = int(n * config.VAL_RATIO), int(n * config.TEST_RATIO)
-        test_indices += idx[:n_test]
-        val_indices += idx[n_test:n_test+n_val]
-        train_indices += idx[n_test+n_val:]
-    
-    train_df = df.loc[train_indices]
-    val_df = df.loc[val_indices]
-    test_df = df.loc[test_indices]
+    train_df, val_df, test_df = split_by_author(df, config.VAL_RATIO, config.TEST_RATIO, config.SEED)
 
     vocab = CharVocabulary()
     vocab.build(train_df[config.CODE_COLUMN].tolist(), max_vocab=config.VOCAB_SIZE)
@@ -441,12 +503,18 @@ def main():
     criterion = ContrastiveLoss(margin=config.MARGIN)
 
     print("Starting Siamese Training...")
+    best_threshold = config.MARGIN / 2
+    best_f1 = 0.0
     for epoch in range(1, config.EPOCHS + 1):
         loss = train_siamese_epoch(model, train_loader, optimizer, criterion, config.DEVICE)
-        val_acc = evaluate_siamese(model, val_loader, config.DEVICE, margin=config.MARGIN)
-        print(f"Epoch {epoch:02d} | Loss: {loss:.4f} | Val Acc: {val_acc:.4f}")
+        best_threshold, best_f1 = find_best_threshold_siamese(model, val_loader, config.DEVICE)
+        val_acc = evaluate_siamese(model, val_loader, config.DEVICE, threshold=best_threshold)
+        print(
+            f"Epoch {epoch:02d} | Loss: {loss:.4f} | Val Acc: {val_acc:.4f} | "
+            f"Best F1: {best_f1:.4f} | Thresh: {best_threshold:.4f}"
+        )
 
-    test_acc = evaluate_siamese(model, test_loader, config.DEVICE, margin=config.MARGIN)
+    test_acc = evaluate_siamese(model, test_loader, config.DEVICE, threshold=best_threshold)
     print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
     # Verification Demo
@@ -462,7 +530,7 @@ def main():
         diff_author = author_labels[1]
         query_diff = test_df[test_df["label"] == diff_author][config.CODE_COLUMN].iloc[0]
         
-        verifier = VerificationSystem(model, vocab, lex, config.DEVICE, threshold=config.MARGIN/2)
+        verifier = VerificationSystem(model, vocab, lex, config.DEVICE, threshold=best_threshold)
         
         is_same1, dist1 = verifier.verify(ref_codes, query_same)
         print(f"Same Author Check: Expected True, Got {is_same1} (dist: {dist1:.4f})")
@@ -475,7 +543,9 @@ def main():
         'model_state': model.state_dict(),
         'vocab': vocab,
         'config': config,
-        'lex_extractor': lex
+        'lex_extractor': lex,
+        'threshold': best_threshold,
+        'seed': config.SEED
     }, "siamese_author_model.pt")
     print("\nModel saved to siamese_author_model.pt")
 

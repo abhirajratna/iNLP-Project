@@ -15,18 +15,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 
 
 class MultiSiamConfig:
     DATA_PATH = "datasets/"
     CODE_COLUMN = "flines"
     AUTHOR_COLUMN = "username"
-    TOP_N_AUTHORS = 30
+    TOP_N_AUTHORS = 50
     MIN_SAMPLES_PER_AUTHOR = 15
     MAX_SEQ_LEN = 1000
 
-    USE_LEXICAL_FEATURES = False
+    USE_LEXICAL_FEATURES = True
     VOCAB_SIZE = 200
     EMBED_DIM = 64
     HIDDEN_DIM = 256
@@ -35,7 +35,7 @@ class MultiSiamConfig:
     OUT_DIM = 128
 
     GROUP_SIZE = 4  # Number of samples per author in one training "group"
-    BATCH_SIZE = 8  # Batch of groups
+    BATCH_SIZE = 2  # Batch of groups
     EPOCHS = 40
     LR = 5e-4
     MARGIN = 0.5  # Triplet Margin
@@ -289,12 +289,53 @@ def evaluate_multisiam_metrics(model, vocab, lex, df, config, num_samples=500, t
         y_pred.append(int(is_match))
         distances.append(dist)
         
+    if not distances:
+        metrics = {
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "avg_dist": 0.0,
+            "auc_roc": 0.0,
+            "eer": 0.0,
+            "fpr": 0.0,
+            "fnr": 0.0
+        }
+        return metrics, y_true, distances
+
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    distances_arr = np.array(distances)
+
+    tn = np.sum((y_true_arr == 0) & (y_pred_arr == 0))
+    fp = np.sum((y_true_arr == 0) & (y_pred_arr == 1))
+    fn = np.sum((y_true_arr == 1) & (y_pred_arr == 0))
+    tp = np.sum((y_true_arr == 1) & (y_pred_arr == 1))
+
+    fpr = fp / max(fp + tn, 1)
+    fnr = fn / max(fn + tp, 1)
+
+    scores = -distances_arr
+    try:
+        auc_roc = roc_auc_score(y_true_arr, scores)
+        roc_fpr, roc_tpr, _ = roc_curve(y_true_arr, scores)
+        roc_fnr = 1 - roc_tpr
+        eer_idx = int(np.argmin(np.abs(roc_fpr - roc_fnr)))
+        eer = float((roc_fpr[eer_idx] + roc_fnr[eer_idx]) / 2)
+    except ValueError:
+        auc_roc = 0.0
+        eer = 0.0
+
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
-        "avg_dist": np.mean(distances)
+        "avg_dist": np.mean(distances),
+        "auc_roc": auc_roc,
+        "eer": eer,
+        "fpr": fpr,
+        "fnr": fnr
     }
     return metrics, y_true, distances
 
@@ -315,22 +356,30 @@ def find_optimal_threshold(y_true, distances):
     return best_thresh, best_f1
 
 
+def split_by_author(df: pd.DataFrame, val_ratio: float, test_ratio: float, seed: int):
+    authors = df["label"].unique().tolist()
+    rng = random.Random(seed)
+    rng.shuffle(authors)
+    n = len(authors)
+    n_val, n_test = int(n * val_ratio), int(n * test_ratio)
+    val_authors = set(authors[:n_val])
+    test_authors = set(authors[n_val:n_val + n_test])
+    train_authors = set(authors[n_val + n_test:])
+    train_df = df[df["label"].isin(train_authors)].copy()
+    val_df = df[df["label"].isin(val_authors)].copy()
+    test_df = df[df["label"].isin(test_authors)].copy()
+    return train_df, val_df, test_df
+
+
 def main():
     cfg = MultiSiamConfig()
+    random.seed(cfg.SEED)
+    np.random.seed(cfg.SEED)
     torch.manual_seed(cfg.SEED)
     
     from .siamese import load_raw_data
     df, author2idx = load_raw_data(cfg)
-    authors = df["label"].unique()
-    train_idx, val_idx, test_idx = [], [], []
-    for a in authors:
-        idx = df[df["label"] == a].index.tolist()
-        random.shuffle(idx)
-        n = len(idx)
-        n_val, n_test = int(n * cfg.VAL_RATIO), int(n * cfg.TEST_RATIO)
-        test_idx += idx[:n_test]; val_idx += idx[n_test:n_test+n_val]; train_idx += idx[n_test+n_val:]
-    
-    train_df, val_df, test_df = df.loc[train_idx], df.loc[val_idx], df.loc[test_idx]
+    train_df, val_df, test_df = split_by_author(df, cfg.VAL_RATIO, cfg.TEST_RATIO, cfg.SEED)
     vocab = CharVocabulary()
     vocab.build(train_df[cfg.CODE_COLUMN].tolist(), cfg.VOCAB_SIZE)
     lex = LexicalFeatureExtractor() if cfg.USE_LEXICAL_FEATURES else None
@@ -353,7 +402,7 @@ def main():
         if val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
             best_thresh, _ = find_optimal_threshold(y_v, d_v)
-            torch.save({'model_state': model.state_dict(), 'vocab': vocab, 'lex_extractor': lex, 'threshold': best_thresh}, "multisiam_best.pt")
+            torch.save({'model_state': model.state_dict(), 'vocab': vocab, 'lex_extractor': lex, 'threshold': best_thresh, 'seed': cfg.SEED}, "multisiam_best.pt")
             print(f"Epoch {epoch:02d} | Loss: {loss:.4f} | NEW BEST! Val Acc: {val_metrics['accuracy']:.4f} | F1: {best_val_f1:.4f} | Thresh: {best_thresh:.3f}")
         else:
             print(f"Epoch {epoch:02d} | Loss: {loss:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | F1: {val_metrics['f1']:.4f}")
@@ -370,7 +419,7 @@ def main():
 
     # N-vs-1 Verification Demo
     print("\n--- N-vs-1 Verification Demo ---")
-    verifier = MultiSiamVerification(model, vocab, lex, cfg.DEVICE, threshold=0.5)
+    verifier = MultiSiamVerification(model, vocab, lex, cfg.DEVICE, threshold=best_thresh)
     
     author_labels = list(set(test_df["label"]))
     if len(author_labels) >= 2:
@@ -389,7 +438,7 @@ def main():
             is_same2, sim2 = verifier.verify(refs, q_neg)
             print(f"Diff Author (N=4): Got {is_same2} (Similarity: {sim2:.4f})")
 
-    torch.save({'model_state': model.state_dict(), 'vocab': vocab, 'lex_extractor': lex}, "multisiam_author_model.pt")
+    torch.save({'model_state': model.state_dict(), 'vocab': vocab, 'lex_extractor': lex, 'seed': cfg.SEED}, "multisiam_author_model.pt")
     print("\nMultiSiam model saved to multisiam_author_model.pt")
 
 if __name__ == "__main__":
